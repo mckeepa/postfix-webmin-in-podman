@@ -57,6 +57,8 @@ every start while preserving other module settings.
   running service.
 - [deploy.sh](./deploy.sh): deploys the built image with persistent storage,
   initial credentials, and a boot-starting systemd Quadlet.
+- [configure-firewall.sh](./configure-firewall.sh): optional, explicit Webmin
+  firewall access for all sources or an IPv4 address/CIDR range.
 - [templates/postfix-webmin.container.in](./templates/postfix-webmin.container.in):
   Quadlet configuration template used by deployment (systemd INI format, not YAML).
 - [setup.sh](./setup.sh): runs the platform, build, and deployment scripts in order;
@@ -453,25 +455,62 @@ Do not disable SELinux or use `chmod 777`.
 
 ### Network access
 
-On the firewall, allow TCP/10000 **only from the management server's fixed
-source IP**. Do not add a general public rule for that port. For example, adapt
-this firewalld rich rule to the server's zone and management-server address:
+Installation and deployment **do not open the host firewall**. Remote access
+requires both a non-localhost Webmin binding and a firewall rule for TCP/10000.
+Deployment checks HTTPS inside the container, not browser connectivity.
+
+Run the optional firewall script as an administrator with `sudo` access,
+**not with `sudo ./configure-firewall.sh`**. Firewalld must already be installed
+and running. Find the zone for the mail server's management interface:
 
 ```bash
-sudo firewall-cmd --permanent --zone=<zone> \
-  --add-rich-rule='rule family="ipv4" source address="<MANAGEMENT_SERVER_IP>/32" port port="10000" protocol="tcp" accept'
-sudo firewall-cmd --reload
+sudo firewall-cmd --get-active-zones
 ```
 
-Remove any broader rule that also allows TCP/10000. After the e-mail admins
-approve public SMTP, bind SMTP to the intended server address and replace the
-container while retaining the volumes:
+Choose **one** option. Replace `public` with your zone and the example source
+with the **client's** IP or network, not the mail server's bind address:
+
+```bash
+# One IPv4 address (recommended for the management server)
+./configure-firewall.sh --zone public --source 192.0.2.10
+
+# An IPv4 network in CIDR notation
+./configure-firewall.sh --zone public --source 192.0.2.0/24
+
+# All sources (approved test environments only)
+./configure-firewall.sh --zone public --source all
+```
+
+> [!WARNING]
+> `all` allows every reachable source, IPv4 and IPv6, to TCP/10000 in that zone.
+> For production, restrict access to the management server. IP/CIDR restrictions
+> support IPv4 only.
+
+The script changes **runtime and permanent** rules without reloading firewalld:
+
+- Replaces the zone's direct `10000/tcp` opening and simple IPv4 source-address
+  rich accept rules for that port, including manually added rules. Switching
+  from `all` to IP/CIDR removes the broad port opening.
+- Leaves SMTP, bindings, other zones, services, and custom rules unchanged.
+  Review these separately: they may independently allow broader access.
+- Stops and reports command failures; applied changes are not rolled back.
+
+Check both configurations, then test `https://<mail-server-management-IP>:10000/`
+from allowed and, when restricting access, disallowed clients:
+
+```bash
+sudo firewall-cmd --zone=public --list-all
+sudo firewall-cmd --permanent --zone=public --list-all
+```
+
+After the e-mail admins approve public SMTP, bind it to the intended server
+address and replace the container while retaining the volumes:
 
 > [!WARNING]
 > **Replace both example addresses below.** `10.20.30.15` means the **mail
 > server's management-interface IP**; `192.0.2.25` means its **SMTP-facing host
 > IP**. Each bind address must be assigned to this host.
-> The firewall's `<MANAGEMENT_SERVER_IP>` above is different: it is the
+> The firewall script's `--source` address above is different: it is the
 > **source IP of the separate server allowed to administer Webmin**.
 
 ```bash
@@ -717,9 +756,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
 These tests mock host and Podman commands; they do not change running services,
-accounts, or volumes. They check stage boundaries, prerequisites, initial
-password setup, and the all-in-one wrapper. A real deployment and reboot test
-are still required on the target server.
+accounts, volumes, or firewall rules. They check stage boundaries, prerequisites,
+initial password setup, firewall mode changes and failures, and the all-in-one
+wrapper. A real deployment, firewall access check, and reboot test are still
+required on the target server.
 
 The optional SMTP integration test requires an image in the **invoking account's**
 Podman store, separate from the service account's deployment:

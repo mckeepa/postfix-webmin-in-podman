@@ -63,7 +63,8 @@ class StageTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.project = Path(self.temp.name)
         (self.project / "scripts").mkdir()
-        for name in ("setup.sh", "platform-setup.sh", "build-image.sh", "deploy.sh"):
+        for name in ("setup.sh", "platform-setup.sh", "build-image.sh", "deploy.sh",
+                     "configure-firewall.sh"):
             shutil.copy2(ROOT / name, self.project / name)
         shutil.copytree(ROOT / "templates", self.project / "templates")
         common = (ROOT / "scripts/common.sh").read_text()
@@ -71,13 +72,13 @@ class StageTests(unittest.TestCase):
         self.log = self.project / "commands.log"
         self.quadlet = self.project / "test.container"
 
-    def run_stage(self, name, interactive=False, **variables):
+    def run_stage(self, name, interactive=False, arguments=(), **variables):
         env = dict(os.environ, TEST_LOG=str(self.log), TEST_QUADLET=str(self.quadlet))
         env.update(variables)
         master, slave = pty.openpty() if interactive else (None, None)
         try:
             process = subprocess.Popen(
-                ["bash", str(self.project / name)],
+                ["bash", str(self.project / name), *arguments],
                 cwd="/",
                 env=env,
                 stdin=slave if interactive else subprocess.DEVNULL,
@@ -96,6 +97,118 @@ class StageTests(unittest.TestCase):
 
     def commands(self):
         return self.log.read_text() if self.log.exists() else ""
+
+    def run_firewall(self, source, zone="public", **variables):
+        return self.run_stage(
+            "configure-firewall.sh", arguments=("--zone", zone, "--source", source), **variables
+        )
+
+    def mock_firewall(self):
+        with (self.project / "scripts/common.sh").open("a") as common:
+            common.write(r"""
+sudo() { "$@"; }
+firewall-cmd() {
+    printf 'firewall: %s\n' "$*" >> "$TEST_LOG"
+    local scope=runtime option= arg file rule
+    for arg in "$@"; do
+        case "$arg" in
+            --permanent) scope=permanent ;;
+            --zone=*) ;;
+            *) option="$arg" ;;
+        esac
+    done
+    if [[ "$option" == "${TEST_FIREWALL_FAIL:-}" ]]; then return 2; fi
+    file="$TEST_LOG.$scope"
+    case "$option" in
+        --state) printf 'running\n' ;;
+        --get-zones) printf 'public internal\n' ;;
+        --list-rich-rules)
+            if [[ -f "$file.rules" ]]; then cat "$file.rules"; fi
+            ;;
+        --add-port=10000/tcp) touch "$file.port" ;;
+        --remove-port=10000/tcp) rm "$file.port" ;;
+        --query-port=10000/tcp) [[ -f "$file.port" ]] ;;
+        --add-rich-rule=*)
+            rule="${option#*=}"
+            if ! grep -Fxq -- "$rule" "$file.rules" 2>/dev/null; then
+                printf '%s\n' "$rule" >> "$file.rules"
+            fi
+            ;;
+        --remove-rich-rule=*)
+            rule="${option#*=}"
+            grep -Fxv -- "$rule" "$file.rules" > "$file.next" || [[ $? == 1 ]] || return
+            mv "$file.next" "$file.rules"
+            ;;
+        --query-rich-rule=*) grep -Fxq -- "${option#*=}" "$file.rules" ;;
+        *) printf 'Unexpected firewall command: %s\n' "$*" >&2; return 98 ;;
+    esac
+}
+""")
+
+    def test_firewall_replaces_access_in_both_scopes_without_reload(self):
+        self.mock_firewall()
+        custom = 'rule family="ipv4" port port="2525" protocol="tcp" accept'
+        old = (
+            'rule family="ipv4" source address="198.51.100.1" '
+            'port port="10000" protocol="tcp" accept'
+        )
+        for scope in ("runtime", "permanent"):
+            (self.project / f"commands.log.{scope}.rules").write_text(custom + "\n" + old + "\n")
+            (self.project / f"commands.log.{scope}.port").touch()
+        for source in ("192.0.2.10", "192.0.2.0/24", "192.0.2.0/24",
+                       "all", "all", "192.0.2.10/32", "0.0.0.0/0"):
+            with self.subTest(source=source):
+                status, output = self.run_firewall(source)
+                self.assertEqual(status, 0, output)
+                for scope in ("runtime", "permanent"):
+                    rules = (self.project / f"commands.log.{scope}.rules").read_text().splitlines()
+                    port = self.project / f"commands.log.{scope}.port"
+                    if source == "all":
+                        self.assertEqual(rules, [custom])
+                        self.assertTrue(port.exists())
+                        self.assertIn("WARNING: Allowing Webmin", output)
+                    else:
+                        expected = (
+                            f'rule family="ipv4" source address="{source}" '
+                            'port port="10000" protocol="tcp" accept'
+                        )
+                        self.assertEqual(rules, [custom, expected])
+                        self.assertFalse(port.exists())
+        self.assertNotIn("--reload", self.commands())
+        self.assertNotIn("podman", self.commands())
+
+    def test_firewall_rejects_invalid_input_before_commands(self):
+        self.mock_firewall()
+        for source in ("", "256.0.0.1", "192.0.2.01", "192.0.2.1/33",
+                       "192.0.2.1/024", "192.0.2.1/08", "::1", "192.0.2.1\naccept"):
+            with self.subTest(source=source):
+                status, output = self.run_firewall(source)
+                self.assertNotEqual(status, 0, output)
+                self.assertEqual(self.commands(), "")
+        for args in ((), ("--source", "all"), ("--zone",), ("--unknown",)):
+            with self.subTest(args=args):
+                status, output = self.run_stage("configure-firewall.sh", arguments=args)
+                self.assertNotEqual(status, 0, output)
+                self.assertEqual(self.commands(), "")
+
+    def test_firewall_checks_zone_and_propagates_failures(self):
+        self.mock_firewall()
+        status, output = self.run_firewall("all", zone="missing")
+        self.assertNotEqual(status, 0, output)
+        self.assertIn("does not exist", output)
+        self.assertNotIn("--add-", self.commands())
+        rule = (
+            'rule family="ipv4" source address="192.0.2.10" '
+            'port port="10000" protocol="tcp" accept'
+        )
+        for option in ("--state", f"--add-rich-rule={rule}", "--query-port=10000/tcp"):
+            with self.subTest(option=option):
+                self.log.unlink(missing_ok=True)
+                status, output = self.run_firewall("192.0.2.10", TEST_FIREWALL_FAIL=option)
+                self.assertEqual(status, 2, output)
+                self.assertNotIn("Webmin TCP/10000 configured", output)
+                self.assertIn("exit 2", output)
+                self.assertNotIn("--permanent --zone=public --add-", self.commands())
 
     def test_platform_only_provisions_host_prerequisites(self):
         # Model a supported host with packages and subordinate ranges already present.
