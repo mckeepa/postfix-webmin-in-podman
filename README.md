@@ -2,14 +2,26 @@
 
 This project runs Postfix and Webmin in a Rocky Linux container. Podman is
 installed on the host with DNF, and the container is built and run rootlessly
-by a dedicated, locked `postfix-webmin` service account. The example image is
+by a dedicated, locked `postfix-webmin` service account. The image is
 pinned to the Rocky Linux 9 x86_64 image digest and Webmin 2.670-1; rebuild and
 patch it through the controlled update process below.
 
 Webmin is installed from its official DNF repository. The repository setup
 script is fetched from a fixed upstream commit and DNF verifies signed RPMs.
 
-## Intended use and security boundary
+Follow these stages in order:
+
+1. [Initial platform setup](#1-initial-platform-setup)
+2. [Build the container image](#2-build-the-container-image)
+3. [Install and deploy the image](#3-install-and-deploy-the-image)
+4. [Management, maintenance, and troubleshooting](#4-management-maintenance-and-troubleshooting)
+
+For a fresh installation with localhost-only access, `./setup.sh` runs all three
+installation stages in order. Alternatively, run each stage separately below.
+Always run the host scripts as an administrator with `sudo` access, **not as
+root and not with `sudo ./script.sh`**.
+
+### Intended use and security boundary
 
 - Webmin is for Postfix administration only. The package includes other
   modules, so create a dedicated Webmin user and grant it access only to
@@ -30,91 +42,260 @@ script is fetched from a fixed upstream commit and DNF verifies signed RPMs.
 - The setup installs a rootless Quadlet unit and enables lingering for the
   service account, so systemd starts the container after boot.
 
-  Webmin's Postfix module uses `/usr/sbin/postfix start`, `stop`, and `reload`.
-  There is no systemd inside the container; only the host's rootless container
-  service uses systemd. The entrypoint enforces these three module commands on
-  every start, including for existing Webmin configuration volumes, while
-  preserving other module settings.
+Webmin's Postfix module uses `/usr/sbin/postfix start`, `stop`, and `reload`.
+There is no systemd inside the container; only the host's rootless container
+service uses systemd. The entrypoint enforces these three module commands on
+every start while preserving other module settings.
 
-## Why use rootless Podman instead of installing on the host?
+### Project files
 
-With a direct host installation, Webmin's privileged functions run in the
-host's security context. A Webmin compromise could therefore affect the host
-operating system as well as Postfix. Here, Webmin and Postfix run in the
-container's filesystem and user namespace; container root maps to the
-unprivileged `postfix-webmin` service account, not host root or an
-administrator's login account. The container is given only its Postfix/
-Webmin data volumes and published ports, rather than broad host directories
-or the Podman socket. This reduces the likely impact of a service compromise
-and makes the runtime boundary easier to inspect.
+- [Containerfile](./Containerfile): builds Rocky Linux with Postfix and the Webmin DNF package,
+  and saves initial configuration for empty volumes.
+- [platform-setup.sh](./platform-setup.sh): installs host dependencies and
+  provisions the locked service account and rootless boot prerequisites.
+- [build-image.sh](./build-image.sh): builds the image without changing the
+  running service.
+- [deploy.sh](./deploy.sh): deploys the built image with persistent storage,
+  initial credentials, and a boot-starting systemd Quadlet.
+- [templates/postfix-webmin.container.in](./templates/postfix-webmin.container.in):
+  Quadlet configuration template used by deployment (systemd INI format, not YAML).
+- [setup.sh](./setup.sh): runs the platform, build, and deployment scripts in order;
+  stops if any stage fails.
+- [scripts/common.sh](./scripts/common.sh): shared settings and service-account
+  checks, sourced by the host scripts; do not run it directly.
+- [container-entrypoint.sh](./container-entrypoint.sh): seeds empty volumes, configures Webmin's Postfix
+  control commands, starts Postfix, and runs Webmin in the foreground.
 
-This is **risk reduction, not a guarantee or a complete sandbox**. The
-container shares the host kernel, and a compromised Webmin can still control
-Postfix and access the mail/configuration data mounted into this container.
-Rootless Podman also does not replace patching, HTTPS, account restrictions,
-backups, or the firewall rule limiting Webmin to the management server.
+## 1. Initial platform setup
 
-## Requirements
+### Requirements
 
 - An x86_64 Rocky Linux, AlmaLinux, RHEL, Fedora, or other DNF-based
   RHEL-family host. The pinned base image digest is for x86_64.
 - An administrator account with `sudo` access. It runs the setup script but
   does not own or run the container.
+- Git to clone this repository.
 - The setup creates a locked non-login account named `postfix-webmin`, assigns
   it a free 65,536-ID subordinate UID/GID range, and enables systemd lingering
   for boot startup.
 
-## Install
+### Prepare the host
 
-Run the script from the project directory as an administrator account with
-`sudo` access (not as root and not with `sudo`):
+Clone the repository, then run platform setup as an administrator with `sudo`
+access (not as root and not with `sudo`):
 
 ```bash
-./setup.sh
+git clone https://github.com/mckeepa/postfix-webmin-in-podman.git
+cd postfix-webmin-in-podman
+./platform-setup.sh
 ```
+
+This installs `podman`, `shadow-utils-subid`, `slirp4netns`, and `fuse-overlayfs`
+with DNF when needed. It creates the `postfix-webmin` service account with home
+`/var/lib/postfix-webmin` (mode 0700), a locked password, no supplementary groups,
+and a nologin shell. It assigns non-overlapping subordinate UID/GID ranges,
+enables systemd lingering, and verifies rootless Podman.
+
+The service account owns the image store, Quadlet, and persistent volumes.
+This stage **does not build an image or start a container**. It can be rerun
+to check or provision the host prerequisites.
+
+## 2. Build the container image
+
+After platform setup, run from the project directory:
+
+```bash
+./build-image.sh
+```
+
+This copies the Containerfile and entrypoint into a service-account-owned build
+directory and builds **`localhost/postfix-webmin:local`** in that account's
+rootless Podman store. Podman builds the Docker-compatible image from the
+Containerfile; Docker is not required.
+
+The build installs Postfix and the pinned Webmin RPM from its official DNF
+repository. It saves initial configuration for empty data volumes.
+Postfix listens on all **container** interfaces so Podman's published SMTP port
+can reach it. Host exposure is still controlled separately by `SMTP_BIND_ADDRESS`
+and the firewall; the host binding defaults to localhost only.
+**Building does not stop or replace the running container.**
+
+To select an approved Webmin RPM version-release, set `WEBMIN_VERSION` on this
+stage, for example `WEBMIN_VERSION=2.670-1 ./build-image.sh`. Review the
+patching guidance before changing pinned versions.
+
+## 3. Install and deploy the image
+
+Deploy the image built in stage 2:
+
+```bash
+./deploy.sh
+```
+
+On a new installation, this prompts for the Webmin `root` password, creates
+the five named data volumes, writes the Quadlet, starts the service, and
+waits for Webmin HTTPS. It requires the platform and image to exist; it
+**does not install host packages or rebuild the image**.
+
+### Choose the bind addresses
 
 By default, Webmin and SMTP are bound to `127.0.0.1`. To make Webmin reachable
 on the mail server's management-network interface, use that interface's
 specific IP address. Keep SMTP local until the e-mail admins have configured
-and tested Postfix:
+and tested Postfix.
+
+> [!IMPORTANT]
+> **Replace `10.20.30.15` with the mail server's own management-network IPv4
+> address. It is an example, not an address supplied by this project.**
+> Use an address assigned to the server running this container, **not your
+> workstation's IP or the separate management server's IP**.
+
+On the **mail server**, list its interface addresses:
 
 ```bash
-WEBMIN_BIND_ADDRESS=10.20.30.15 ./setup.sh
+ip -br -4 address
 ```
 
-If the container is already running with the default localhost binding, change
-the binding and recreate it while keeping the persistent volumes:
+Choose the address on the interface used for administration, without the
+`/prefix` suffix. For example, if that interface shows `10.50.1.20/24`,
+use **`WEBMIN_BIND_ADDRESS=10.50.1.20`**. Arrange a static address or DHCP
+reservation with your network administrator so it stays consistent.
+
+For a fresh deployment, substitute your address in this example:
 
 ```bash
-WEBMIN_BIND_ADDRESS=10.20.30.15 UPDATE_EXISTING=1 ./setup.sh
+WEBMIN_BIND_ADDRESS=10.20.30.15 ./deploy.sh
 ```
 
-The script installs `podman`, `shadow-utils-subid`, `slirp4netns`, and
-`fuse-overlayfs` with DNF when needed. It creates the `postfix-webmin` service
-account with home `/var/lib/postfix-webmin` (mode 0700), a locked password,
-no supplementary groups, and a nologin shell; assigns it a non-overlapping
-subordinate UID/GID range; and verifies its rootless Podman user namespace.
-The service account owns the image store, Quadlet, and persistent volumes.
-The script prompts for a bootstrap Webmin password only for a new
-installation. Webmin is at
+For an existing installation, **replace the example address here too**.
+This changes the binding and recreates the container while keeping its
+persistent volumes:
+
+```bash
+WEBMIN_BIND_ADDRESS=10.20.30.15 UPDATE_EXISTING=1 ./deploy.sh
+```
+
+The deployment prompts for a bootstrap Webmin password only for a new
+installation; updates retain the existing password. Webmin is at
 `https://<mail-server-management-IP>:10000`. Its initial certificate is
 self-signed; install a trusted certificate before production use.
 
-If upgrading an installation previously run under your login account, run
-`UPDATE_EXISTING=1 ./setup.sh` from that same account. The script stops the
-old container, migrates all five named volumes into the service account's
-Podman storage, and retains the original volumes for rollback.
-It refuses partial or conflicting volume sets instead of starting with empty
-mail data. Keep the old login account's Podman volumes until the new service
-has been verified and backed up. A migration marker prevents later updates
-from re-importing those retained, older volumes.
+Deployment operates only on the `postfix-webmin` service account's Podman storage.
+It refuses incomplete volume sets rather than replacing missing mail data with
+empty volumes.
 
-### Development-run commands
+### Stage options
+
+| Environment variable | Default | Stage | Purpose |
+| --- | --- | --- | --- |
+| `WEBMIN_BIND_ADDRESS` | `127.0.0.1` | Deploy | Host address for Webmin TCP/10000. |
+| `SMTP_BIND_ADDRESS` | `127.0.0.1` | Deploy | Host address for SMTP TCP/2525, forwarded to container TCP/25. |
+| `WEBMIN_TLS_DIR` | unset | Deploy | Absolute host directory containing Webmin's PEM certificate and private key; mounted read-only. |
+| `WEBMIN_VERSION` | `2.670-1` | Build | Exact Webmin RPM version-release to install. |
+| `UPDATE_EXISTING` | `0` | Deploy | Set to `1` to replace an installation while preserving its volumes. |
+
+Specify the intended bind addresses on **every deployment**; omitted values use
+the defaults, including during updates. These variables also work with the
+all-in-one `setup.sh` wrapper and are passed to its stages.
+
+### Use a trusted certificate for Webmin
+
+**Certificates are supplied at deployment, not baked into the image. Renewal
+does not require an image rebuild.** Without `WEBMIN_TLS_DIR`, a new installation
+uses Webmin's built-in self-signed certificate.
+Deployment prints a warning when no external certificate directory is supplied.
+Existing installations retain their stored Webmin certificate in this mode.
+
+Obtain a certificate from a public CA or your organization's internal CA.
+Its **Subject Alternative Name must include the DNS name used to access Webmin**,
+for example `webmin.example.com`. Clients must trust the issuing CA; uploading
+a certificate alone does not establish trust.
+
+Prepare a **dedicated directory** containing:
+
+- `cert.pem`: the server certificate in PEM format.
+- `privkey.pem`: the matching **unencrypted** PEM private key, readable only
+  by the service account and host administrators.
+- `chain.pem`: intermediate CA certificates in PEM format, in issuer order.
+  Omit this file only if no intermediate CA is needed.
+
+> [!IMPORTANT]
+> **Replace `/path/to/issued/` below with the location of your CA-issued files.**
+> Copy files into the dedicated directory; do not bind-mount or relabel the
+> entire `/etc/letsencrypt` directory. Do not commit keys to Git or put PEM
+> contents into environment variables.
+
+```bash
+sudo install -d -o postfix-webmin -g postfix-webmin -m 0700 /var/lib/postfix-webmin/tls
+sudo install -o postfix-webmin -g postfix-webmin -m 0600 \
+  /path/to/issued/cert.pem /var/lib/postfix-webmin/tls/cert.pem
+sudo install -o postfix-webmin -g postfix-webmin -m 0600 \
+  /path/to/issued/privkey.pem /var/lib/postfix-webmin/tls/privkey.pem
+sudo install -o postfix-webmin -g postfix-webmin -m 0600 \
+  /path/to/issued/chain.pem /var/lib/postfix-webmin/tls/chain.pem
+```
+
+Skip the last command if no intermediate is needed. The TLS directory path must
+be absolute and use only letters, digits, `/`, `_`, `.`, and `-`.
+Keep backups of this directory separately: it is **not part of the five named
+volume backups**.
+
+For a fresh deployment with localhost binding:
+
+```bash
+WEBMIN_TLS_DIR=/var/lib/postfix-webmin/tls ./deploy.sh
+```
+
+For an existing deployment:
+
+```bash
+WEBMIN_TLS_DIR=/var/lib/postfix-webmin/tls UPDATE_EXISTING=1 ./deploy.sh
+```
+
+Set `WEBMIN_BIND_ADDRESS` and `SMTP_BIND_ADDRESS` as well if using non-default
+bindings. **Specify `WEBMIN_TLS_DIR` on every deployment once enabled.**
+Deployment refuses to remove an existing TLS mount when the variable is omitted.
+The directory is mounted as `/run/webmin-tls:ro,Z`; the entrypoint validates the
+certificate expiry, key match, and PEM files before starting Webmin. Unusable
+certificates fail startup rather than silently reverting to HTTP or self-signed
+TLS. This configures **Webmin HTTPS only**, not Postfix SMTP TLS.
+
+Verify from a client using the certificate's DNS name and **without `-k`**:
+
+```bash
+curl --fail --show-error https://webmin.example.com:10000/
+```
+
+**Replace `webmin.example.com` with your certificate's DNS name** and ensure DNS
+resolves to the bound management address. For a localhost-only test, add
+`--resolve webmin.example.com:10000:127.0.0.1`. For an internal CA, install the
+CA in your client's trust store or use `--cacert /path/to/root-ca.pem`.
+The deployment readiness probe uses `-k` and is **not a certificate-trust test**.
+
+### Startup after reboot
+
+Deployment substitutes `@IMAGE_NAME@`, `@CONTAINER_NAME@`,
+`@WEBMIN_BIND_ADDRESS@`, `@SMTP_BIND_ADDRESS@`, and `@WEBMIN_TLS_CONFIG@` in
+[the Quadlet template](./templates/postfix-webmin.container.in) and writes
+`/var/lib/postfix-webmin/.config/containers/systemd/postfix-webmin.container`
+with `[Install] WantedBy=default.target`. The template is treated as text, not
+executed as a shell script. Platform setup enables lingering for
+the service account so its user manager starts at boot without a login.
+
+```bash
+loginctl show-user postfix-webmin -p Linger
+```
+
+Confirm `Linger=yes`. After deployment, test an approved reboot and verify
+the service using the status commands in section 4.
+
+## 4. Management, maintenance, and troubleshooting
+
+### Service management
 
 The default Webmin URL is for a browser running on the mail server itself:
 **https://127.0.0.1:10000**. Accept the self-signed certificate warning for
-testing and sign in as `root` with the bootstrap password entered during
-setup.
+initial setup and sign in as `root` with the bootstrap password.
 
 Run these commands from an administrator account with `sudo` access. They
 operate on the dedicated service account's separate rootless Podman store:
@@ -167,31 +348,22 @@ systemctl_service stop postfix-webmin.service
 systemctl_service start postfix-webmin.service
 ```
 
-`podman ps -a` shows stopped containers and their exit status; `podman ps`
-does not. If the health check fails, inspect the logs before repeatedly
-restarting the container.
-
-The Quadlet unit is stored at
-`/var/lib/postfix-webmin/.config/containers/systemd/postfix-webmin.container`
-with `WantedBy=default.target`; the setup enables systemd lingering for the
-service account. To confirm, run
-`loginctl show-user postfix-webmin -p Linger` and check for `Linger=yes`.
-
 ### Reset the Webmin password
 
-The bootstrap username is `root`. Use the Webmin password set
-during the original setup, not the host sudo password. Migration preserves
-the Webmin credentials; passwords cannot be recovered in plaintext.
+The bootstrap username is `root`. Use the Webmin password set during setup,
+not the host sudo password. Container updates preserve credentials;
+passwords cannot be recovered in plaintext.
 
 If forgotten, run this from an administrator terminal. It stops the service,
 updates the existing Webmin configuration in a temporary maintenance
 container, then starts the service. This briefly interrupts mail service.
-Do not run the password tool with `podman exec` in the running service:
-the tool stops Webmin before saving, which terminates the container and can
-interrupt the password update.
+The password tool runs offline because it stops Webmin before saving credentials.
 
 The command prompts without echoing the new password and discovers the
 service account's UID rather than assuming a particular value:
+
+**If using mounted certificates, set `WEBMIN_TLS_DIR` to the same host directory
+in this terminal first.** The maintenance container needs that mount too.
 
 ```bash
 (
@@ -213,9 +385,13 @@ if [[ -z "$PASSWORD" || "$PASSWORD" != "$CONFIRM" ]]; then
   printf 'Passwords must be non-empty and match.\n' >&2
   exit 1
 fi
+TLS_MOUNTS=()
+if [[ -n "${WEBMIN_TLS_DIR:-}" ]]; then
+  TLS_MOUNTS=(-v "$WEBMIN_TLS_DIR:/run/webmin-tls:ro,Z")
+fi
 service_cmd systemctl --user stop postfix-webmin.service
 printf '%s\n' "$PASSWORD" |
-  service_cmd podman run --rm -i --network none \
+  service_cmd podman run --rm -i --network none "${TLS_MOUNTS[@]}" \
     -v postfix-webmin-webmin-config:/etc/webmin:Z \
     -v postfix-webmin-webmin-state:/var/webmin:Z \
     --entrypoint /bin/sh localhost/postfix-webmin:local -c \
@@ -232,7 +408,27 @@ If the maintenance command fails, the service stays stopped so that the
 error can be investigated. Restart it using the service-account start
 command above once the issue is resolved.
 
-### Unexpected container exits
+### Renew the Webmin TLS certificate
+
+Use the service-account helpers from **Service management**:
+
+1. Obtain the renewed certificate and matching key from your CA.
+2. Run `systemctl_service stop postfix-webmin.service`.
+3. Use the `sudo install` commands above to replace `cert.pem`, `privkey.pem`,
+   and, if applicable, `chain.pem` in the **same directory**. Retain the protected
+   ownership and permissions. Replace the files inside the mounted directory,
+   not the directory itself; remove an obsolete `chain.pem` if no longer needed.
+4. Run `systemctl_service start postfix-webmin.service`.
+5. Verify HTTPS using the certificate DNS name without `-k`, as above, and check
+   service logs if startup fails.
+
+**No build or deployment command is needed for renewal.** The mount and
+container environment persist in the Quadlet across restarts and reboots.
+Stopping and starting briefly interrupts both Webmin and Postfix. A CA renewal
+hook can automate the file installation and restart; it must report failures
+and retain a known-good certificate/key pair for rollback.
+
+### Diagnostics
 
 Plain `podman ps` lists only your login account's containers, not the service
 account's containers. Use the `podman_service` and `systemctl_service`
@@ -250,16 +446,12 @@ messages indicate a failure, not a healthy service; capture the application
 error before restarting or rebuilding. Quadlet may remove failed containers,
 so `podman logs` may no longer be available after an exit.
 
-On SELinux-enforcing hosts, the Quadlet mounts all five data volumes with
-`:Z`, giving them the current container's private SELinux label. Replacement
-or diagnostic containers can otherwise encounter `Permission denied` when a
-volume retains another container's private label, even with correct Unix
-ownership. Use `:Z` on each volume in manual diagnostic runs too, and stop
-the service first: relabeling a volume for another container can deny access
-to the original container. Do not disable SELinux or use `chmod 777`.
-To apply updated volume options to an existing installation, run
-`UPDATE_EXISTING=1 ./setup.sh`; it rebuilds and recreates the container while
-retaining its named volumes.
+On SELinux-enforcing hosts, all five volumes use `:Z` for private container
+labels. Stop the service before mounting its volumes in a maintenance container,
+and use `:Z` there too. Relabeling an active service's volumes can deny it access.
+Do not disable SELinux or use `chmod 777`.
+
+### Network access
 
 On the firewall, allow TCP/10000 **only from the management server's fixed
 source IP**. Do not add a general public rule for that port. For example, adapt
@@ -275,22 +467,28 @@ Remove any broader rule that also allows TCP/10000. After the e-mail admins
 approve public SMTP, bind SMTP to the intended server address and replace the
 container while retaining the volumes:
 
+> [!WARNING]
+> **Replace both example addresses below.** `10.20.30.15` means the **mail
+> server's management-interface IP**; `192.0.2.25` means its **SMTP-facing host
+> IP**. Each bind address must be assigned to this host.
+> The firewall's `<MANAGEMENT_SERVER_IP>` above is different: it is the
+> **source IP of the separate server allowed to administer Webmin**.
+
 ```bash
 WEBMIN_BIND_ADDRESS=10.20.30.15 \
 SMTP_BIND_ADDRESS=192.0.2.25 \
-UPDATE_EXISTING=1 ./setup.sh
+UPDATE_EXISTING=1 ./deploy.sh
 ```
 
-In this example, `192.0.2.25` is the mail server's public address. The host
-firewall or an approved low-port listener must forward public TCP/25 to the
-container's host TCP/2525. Do not open TCP/2525 to the public Internet unless
-that is explicitly intended.
+The host firewall or an approved low-port listener must forward public TCP/25
+to the container's host TCP/2525. Do not open TCP/2525 to the public Internet
+unless that is explicitly intended.
 
 Create a dedicated Webmin user limited to the Postfix module, test it, and
 then restrict or disable the bootstrap `root` login. The firewall rule and
 the management server's MFA are complementary controls.
 
-## Durable data and backups
+### Durable data and backups
 
 The setup uses these named volumes, all in the dedicated service account's
 rootless Podman storage:
@@ -390,17 +588,26 @@ systemctl_service start postfix-webmin.service
 The restored Webmin configuration and mail data remain in the service
 account's volumes.
 
-To rebuild and replace the container after backing up, run:
+### Rebuild and update
+
+After backing up, build first and deploy only when the build succeeds:
 
 ```bash
-UPDATE_EXISTING=1 ./setup.sh
+./build-image.sh &&
+UPDATE_EXISTING=1 ./deploy.sh
 ```
 
-This rebuilds the image, replaces only the named container, and reuses the
-volumes. It does not roll back configuration changes or restore data. Keep a
-known-good image reference and backup so a failed update can be recovered.
+These commands use localhost bindings. **If using other bind addresses, set
+`WEBMIN_BIND_ADDRESS` and `SMTP_BIND_ADDRESS` on the deployment command.**
+If using mounted certificates, also set **`WEBMIN_TLS_DIR`**.
+To deploy an image already built, run only `UPDATE_EXISTING=1 ./deploy.sh`.
+To rerun all three stages, use `UPDATE_EXISTING=1 ./setup.sh`.
 
-## TODO: Configure and verify mail security (e-mail admins)
+Deployment replaces only the named container and reuses the volumes. It does
+not roll back configuration changes or restore data. Keep a known-good image
+reference and backup so a failed update can be recovered.
+
+### Production mail checklist
 
 Do not expose SMTP to the Internet until the e-mail admins complete and record
 these steps:
@@ -458,7 +665,7 @@ these steps:
     records, and backup success. Review DMARC reports and update sender
     records when legitimate sending systems change.
 
-## Pinning, patching, and operations
+### Pinning, patching, and operations
 
 - The Rocky base image is pinned by digest, Webmin is pinned to an exact RPM
   version, and the Webmin repository setup script is pinned to an upstream
@@ -472,7 +679,8 @@ these steps:
   image digest in the Containerfile, and run:
 
   ```bash
-  UPDATE_EXISTING=1 ./setup.sh
+  ./build-image.sh &&
+  UPDATE_EXISTING=1 ./deploy.sh
   ```
 
 - Container recreation preserves the existing configuration volumes. Review
@@ -485,7 +693,7 @@ these steps:
 - The setup installs a rootless Quadlet unit and enables lingering for
   `postfix-webmin`. Verify `loginctl show-user postfix-webmin -p Linger`
   reports `Linger=yes`. Use the `systemctl_service` helper from the
-  Development-run commands to check service status. Test reboot recovery and
+  Service management section to check service status. Test reboot recovery and
   confirm the container runs under the locked service account.
 - The container has a health check, but health status alone does not restart
   or alert on a failure. Add monitoring and alerting for health, queue depth,
@@ -500,19 +708,28 @@ these steps:
   Webmin's service-control paths in staging; they need carefully chosen
   writable paths and privileges.
 
-## Should Webmin be in a separate container?
+### Script validation
 
-It is possible, but a second container is not automatically more secure.
-Webmin's Postfix module needs to change Postfix configuration and invoke
-Postfix control commands. A separate Webmin container therefore needs a
-management channel to Postfix. Sharing configuration/queue volumes still lets
-Webmin alter important mail data; mounting the Podman socket grants broad
-container-management authority and should be avoided.
+With Python 3 available, run the isolated stage tests from the project directory:
 
-Separation can reduce process-level blast radius and let Webmin be patched
-independently **only if** the control channel is narrowly scoped and does not
-give Webmin broad host or container privileges. That design needs a separately
-reviewed API/agent and adds operational complexity. For this deployment, keep
-Webmin reachable only from the MFA-protected management server and restrict
-its Webmin account to the Postfix module. Revisit separation if a safe,
-least-privilege control channel is designed.
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+These tests mock host and Podman commands; they do not change running services,
+accounts, or volumes. They check stage boundaries, prerequisites, initial
+password setup, and the all-in-one wrapper. A real deployment and reboot test
+are still required on the target server.
+
+The optional SMTP integration test requires an image in the **invoking account's**
+Podman store, separate from the service account's deployment:
+
+```bash
+podman build --tag localhost/postfix-webmin:test . &&
+POSTFIX_WEBMIN_TEST_IMAGE=localhost/postfix-webmin:test \
+  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+It starts a disposable container on a random localhost port, checks the SMTP
+greeting, and removes that container afterward. Without the image variable,
+this integration test is skipped.

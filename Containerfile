@@ -3,13 +3,14 @@ FROM docker.io/library/rockylinux@sha256:d644d203142cd5b54ad2a83a203e1dee68af222
 ARG WEBMIN_VERSION=2.670-1
 
 RUN dnf upgrade -y && \
-    dnf install -y ca-certificates curl-minimal postfix && \
+    dnf install -y ca-certificates curl-minimal openssl postfix && \
     curl -fsSLo /tmp/webmin-setup-repo.sh \
         https://raw.githubusercontent.com/webmin/webmin/3a2b2b8671c0669c129f5275b3dd1853106ae02b/webmin-setup-repo.sh && \
     sh /tmp/webmin-setup-repo.sh --force && \
     dnf install -y "webmin-${WEBMIN_VERSION}.noarch" && \
     dnf clean all && \
     rm -f /tmp/webmin-setup-repo.sh && \
+    postconf -e 'inet_interfaces = all' && \
     mkdir -p /usr/share/postfix-webmin-defaults && \
     cp -a /etc/postfix /usr/share/postfix-webmin-defaults/postfix && \
     cp -a /var/spool/postfix /usr/share/postfix-webmin-defaults/postfix-queue && \

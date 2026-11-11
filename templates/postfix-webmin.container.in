@@ -1,0 +1,27 @@
+[Unit]
+Description=Postfix and Webmin rootless container
+
+[Container]
+Image=@IMAGE_NAME@
+ContainerName=@CONTAINER_NAME@
+RunInit=true
+PublishPort=@WEBMIN_BIND_ADDRESS@:10000:10000
+PublishPort=@SMTP_BIND_ADDRESS@:2525:25
+HealthCmd=/usr/sbin/postfix status && curl -kfsS https://127.0.0.1:10000/ >/dev/null
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+Volume=postfix-webmin-postfix-config:/etc/postfix:Z
+Volume=postfix-webmin-postfix-queue:/var/spool/postfix:Z
+Volume=postfix-webmin-mail:/var/mail:Z
+Volume=postfix-webmin-webmin-config:/etc/webmin:Z
+Volume=postfix-webmin-webmin-state:/var/webmin:Z
+@WEBMIN_TLS_CONFIG@
+
+[Service]
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target
