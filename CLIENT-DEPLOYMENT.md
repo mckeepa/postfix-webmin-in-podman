@@ -31,7 +31,7 @@ cd postfix-webmin-in-podman
 ./platform-setup.sh
 ```
 
-Use the scripts supplied for your approved image release. Platform setup
+Use the scripts supplied for the approved image release. Platform setup
 installs the required host packages, creates the locked `postfix-webmin`
 service account, and enables startup at boot.
 
@@ -40,9 +40,9 @@ an image locally rather than use the DockerHub image.
 
 ## 2. Pull the published image
 
-Define this helper in your administrator shell. It runs Podman in the service
-account's image store; plain `podman pull` uses your own account's store and
-will not make the image available to deployment.
+The following helper runs Podman in the service account's image store.
+Define it in an administrator shell. Plain `podman pull` uses the invoking
+account's store, which is separate from the store used by deployment.
 
 ```bash
 SERVICE_USER=postfix-webmin
@@ -56,13 +56,14 @@ service_cmd() {
 ```
 
 Public images normally do not require login. For a private repository, first
-authenticate with the client's own authorized DockerHub username and a
+authenticate with an authorized DockerHub username and a
 read-only access token at the password prompt:
 
 ```bash
-service_cmd podman login --username YOUR_DOCKERHUB_USERNAME docker.io
+service_cmd podman login --username DOCKERHUB_USERNAME docker.io
 ```
 
+Replace `DOCKERHUB_USERNAME` with the authenticating account's username.
 Never distribute the publisher's DockerHub token to clients.
 
 Pull and give the image the local name expected by the deployment script:
@@ -95,7 +96,7 @@ Enter and confirm a unique Webmin root password when prompted. By default:
 - Five named volumes hold configuration, credentials, mail, and queue data.
 - The systemd user service starts automatically at boot.
 
-For management from your workstation without exposing Webmin on the network,
+For workstation management without exposing Webmin on the network,
 keep these default bindings and create an SSH tunnel from the workstation
 (replace both placeholders):
 
@@ -105,8 +106,9 @@ ssh -N -L 10000:127.0.0.1:10000 ADMIN_USER@SERVER
 
 Open `https://127.0.0.1:10000` on the workstation. The self-signed certificate
 will cause a browser warning; verify its identity through a trusted channel,
-or install a trusted certificate. Sign in as `root` using the password you
-set, then create a restricted account for routine Postfix administration.
+or install a trusted certificate. Sign in as `root` using the password set
+during deployment, then create a restricted account for routine Postfix
+administration.
 
 For direct network access, follow the
 [TLS](./README.md#tls-for-webmin) and [firewall](./README.md#firewall)

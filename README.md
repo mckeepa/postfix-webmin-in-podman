@@ -103,8 +103,9 @@ previous access granted for that port, and never reloads firewalld.
 
 ## Manage the service
 
-Plain `podman ps` shows your own account's containers, not the service
-account's. Use these helpers from an administrator account:
+Podman container storage is account-specific. `podman ps` lists containers
+owned by the invoking account. The following helper runs management commands
+as the `postfix-webmin` service account:
 
 ```bash
 SERVICE_USER=postfix-webmin
@@ -130,8 +131,8 @@ Lingering keeps the service starting at boot; verify with
 
 ### Reset the Webmin password
 
-With the helper above (set `WEBMIN_TLS_DIR` mount only if you use one; this
-briefly stops the service):
+With the helper above (include the `WEBMIN_TLS_DIR` mount only when external
+TLS is configured; this briefly stops the service):
 
 ```bash
 read -r -s -p 'New Webmin root password: ' PASSWORD; printf '\n'
@@ -188,7 +189,7 @@ and run:
 UPDATE_EXISTING=1 ./deploy.sh
 ```
 
-Add your usual `WEBMIN_BIND_ADDRESS`, `SMTP_BIND_ADDRESS`, and
+Include the configured `WEBMIN_BIND_ADDRESS`, `SMTP_BIND_ADDRESS`, and
 `WEBMIN_TLS_DIR` values to the deploy command. Deployment replaces only the
 container and keeps the volumes; retain the prior image and backups for
 rollback.
@@ -199,18 +200,18 @@ rollback.
 
 This project uses Podman, so Docker CLI installation is not required.
 Log in as the `postfix-webmin` service account that owns the built image.
-Plain `podman login` or `docker login` as your administrator account will not
+Plain `podman login` or `docker login` as an administrator account will not
 provide credentials to the push script.
 
-1. Sign in to [DockerHub](https://hub.docker.com/) in your browser and create
-   the destination repository (for example, `postfix-webmin`) under your user
-   or organization namespace. Review whether it should be public or private.
-2. In your Docker account settings, create a personal access token with
-   **Read & Write** permissions. Keep it secret; use it instead of your account
+1. Sign in to [DockerHub](https://hub.docker.com/) through a browser and create
+   the destination repository (for example, `postfix-webmin`) under the target
+   user or organization namespace. Select public or private visibility.
+2. In the Docker account settings, create a personal access token with
+   **Read & Write** permissions. Keep it secret; use it instead of the account
    password, especially when two-factor authentication is enabled.
-3. Run this entire block from your administrator shell after platform setup.
+3. Run this entire block from an administrator shell after platform setup.
    It defines `service_cmd` for the current shell; it is not an installed
-   command. Replace `YOUR_DOCKERHUB_USERNAME` with your personal DockerHub
+   command. Replace `DOCKERHUB_USERNAME` with the authenticating DockerHub
    username, not an organization name:
 
    ```bash
@@ -223,16 +224,10 @@ provide credentials to the push script.
        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$SERVICE_UID/bus" "$@"
    }
 
-   service_cmd podman login --username YOUR_DOCKERHUB_USERNAME docker.io
+   service_cmd podman login --username DOCKERHUB_USERNAME docker.io
    ```
 
-   For example, for the `mckeepa` DockerHub account:
-
-   ```bash
-   service_cmd podman login --username mckeepa docker.io
-   ```
-
-   If `sudo` prompts for a password, enter your administrator password.
+   If `sudo` prompts for a password, enter the administrator account password.
    At Podman's `Password:` prompt, paste the DockerHub access token. Input is
    hidden; do not put the token directly in a shell command.
 4. Confirm the stored login:
@@ -251,32 +246,32 @@ service_cmd podman logout docker.io
 
 ### Build and publish
 
-Set your lowercase DockerHub user or organization namespace once in your shell,
+Set the lowercase DockerHub user or organization namespace in the shell,
 then build and publish with the separate push command:
 
 ```bash
-export DOCKERHUB_NAMESPACE=your-namespace
+export DOCKERHUB_NAMESPACE=example-namespace
 ./build-image.sh
 ./push-image.sh
 ```
 
 With no argument, the destination is
-`docker.io/$DOCKERHUB_NAMESPACE/postfix-webmin:latest`. Replace `your-namespace`
-with your actual namespace. To retain this setting across shell sessions, add
-the export to your shell startup configuration. This variable selects the
-destination; it does not change the DockerHub account you log in as. That
+`docker.io/$DOCKERHUB_NAMESPACE/postfix-webmin:latest`. Replace `example-namespace`
+with the target namespace. To retain this setting across shell sessions, add
+the export to the shell startup configuration. This variable selects the
+destination; it does not change the authenticated DockerHub account. That
 account must have push permission for the chosen namespace.
 
 An explicit destination overrides the configured namespace, for example:
 
 ```bash
-./push-image.sh docker.io/your-namespace/postfix-webmin:release-1
+./push-image.sh docker.io/example-namespace/postfix-webmin:release-1
 ```
 
 The push command checks that the image exists, runs `podman login docker.io`
 as the service account (reusing valid stored credentials when available), and
 pushes the built image to the selected destination.
-At the login prompt, use your DockerHub username and an access token with push
+At the login prompt, use the DockerHub username and an access token with push
 permission as the password; do not put the token in the command line.
 
 Publishing is never part of installation or deployment. The command does not
