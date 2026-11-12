@@ -50,6 +50,8 @@ as_service_user() {
             ;;
         'podman container') [[ "${TEST_CONTAINER:-1}" == 1 ]] ;;
         'podman build'|'podman rm'|'podman exec') return 0 ;;
+        'podman pull') return "${TEST_PULL_STATUS:-0}" ;;
+        'podman tag') return "${TEST_TAG_STATUS:-0}" ;;
         'podman login') return "${TEST_LOGIN_STATUS:-0}" ;;
         'podman push') return "${TEST_PUSH_STATUS:-0}" ;;
         'podman run') cat >/dev/null ;;
@@ -66,7 +68,8 @@ class StageTests(unittest.TestCase):
         self.project = Path(self.temp.name)
         (self.project / "scripts").mkdir()
         for name in ("setup.sh", "platform-setup.sh", "build-image.sh", "deploy.sh",
-                     "configure-firewall.sh", "push-image.sh"):
+                     "configure-firewall.sh", "push-image.sh", "client-deploy.sh",
+                     "service-command.sh"):
             shutil.copy2(ROOT / name, self.project / name)
         shutil.copytree(ROOT / "templates", self.project / "templates")
         common = (ROOT / "scripts/common.sh").read_text()
@@ -81,7 +84,7 @@ class StageTests(unittest.TestCase):
         master, slave = pty.openpty() if interactive else (None, None)
         try:
             process = subprocess.Popen(
-                ["bash", str(self.project / name), *arguments],
+                [str(self.project / name), *arguments],
                 cwd="/",
                 env=env,
                 stdin=slave if interactive else subprocess.DEVNULL,
@@ -248,12 +251,121 @@ awk() {
         self.assertFalse(self.quadlet.exists())
 
     def test_stages_require_platform_before_modifying_data(self):
-        for stage in ("build-image.sh", "deploy.sh"):
+        for stage in ("build-image.sh", "deploy.sh", "client-deploy.sh",
+                      "service-command.sh"):
             with self.subTest(stage=stage):
-                status, output = self.run_stage(stage, TEST_ACCOUNT="0")
+                arguments = ("podman", "ps") if stage == "service-command.sh" else ()
+                status, output = self.run_stage(
+                    stage, arguments=arguments, TEST_ACCOUNT="0"
+                )
                 self.assertNotEqual(status, 0)
                 self.assertIn("Run ./platform-setup.sh first", output)
                 self.assertEqual(self.commands(), "")
+
+    def test_client_pulls_and_tags_before_deploying_without_building(self):
+        for arguments, image in (
+            ((), "docker.io/mckeepa/postfix-webmin:latest"),
+            (("docker.io/example/postfix-webmin:release-1",),
+             "docker.io/example/postfix-webmin:release-1"),
+            (("docker.io/example/postfix-webmin@sha256:" + "a" * 64,),
+             "docker.io/example/postfix-webmin@sha256:" + "a" * 64),
+        ):
+            with self.subTest(arguments=arguments):
+                self.log.unlink(missing_ok=True)
+                status, output = self.run_stage(
+                    "client-deploy.sh", arguments=arguments, UPDATE_EXISTING="1",
+                    WEBMIN_BIND_ADDRESS="10.50.1.20",
+                    WEBMIN_TLS_DIR="/var/lib/postfix-webmin/tls",
+                )
+                self.assertEqual(status, 0, output)
+                commands = self.commands()
+                pull = f"podman pull -- {image}"
+                tag = f"podman tag -- {image} localhost/postfix-webmin:local"
+                self.assertLess(commands.index(pull), commands.index(tag))
+                self.assertLess(commands.index(tag), commands.index("systemctl --user stop"))
+                self.assertIn("systemctl --user start", commands)
+                self.assertNotIn("podman build", commands)
+                self.assertNotIn("podman run", commands)
+                quadlet = self.quadlet.read_text()
+                self.assertIn("PublishPort=10.50.1.20:10000:10000", quadlet)
+                self.assertIn("Volume=/var/lib/postfix-webmin/tls:", quadlet)
+
+    def test_client_stops_before_deployment_on_registry_or_tag_failure(self):
+        for variables, forbidden in (
+            ({"TEST_PULL_STATUS": "125"}, "podman tag"),
+            ({"TEST_TAG_STATUS": "125"}, "podman image exists"),
+        ):
+            with self.subTest(variables=variables):
+                self.log.unlink(missing_ok=True)
+                status, output = self.run_stage(
+                    "client-deploy.sh", UPDATE_EXISTING="1", **variables
+                )
+                self.assertNotEqual(status, 0, output)
+                self.assertIn("Deployment was not started", output)
+                self.assertNotIn(forbidden, self.commands())
+                self.assertNotIn("systemctl --user stop", self.commands())
+                self.assertFalse(self.quadlet.exists())
+
+    def test_client_propagates_deployment_refusal_without_replacing_service(self):
+        status, output = self.run_stage("client-deploy.sh", UPDATE_EXISTING="0")
+        self.assertNotEqual(status, 0, output)
+        self.assertIn("set UPDATE_EXISTING=1", output)
+        self.assertNotIn("systemctl --user stop", self.commands())
+        self.assertFalse(self.quadlet.exists())
+
+    def test_client_fresh_install_sets_password_without_building(self):
+        status, output = self.run_stage(
+            "client-deploy.sh", interactive=True, TEST_VOLUMES="none",
+            TEST_CONTAINER="0", UPDATE_EXISTING="0",
+        )
+        self.assertEqual(status, 0, output)
+        commands = self.commands()
+        self.assertLess(commands.index("podman pull"), commands.index("podman run"))
+        self.assertLess(commands.index("podman run"), commands.index("systemctl --user start"))
+        self.assertNotIn("podman build", commands)
+        self.assertNotIn("systemctl --user stop", commands)
+
+    def test_client_and_service_command_reject_invalid_argument_counts(self):
+        for stage, arguments in (
+            ("client-deploy.sh", ("image", "extra")),
+            ("service-command.sh", ()),
+        ):
+            with self.subTest(stage=stage):
+                status, output = self.run_stage(stage, arguments=arguments)
+                self.assertNotEqual(status, 0, output)
+                self.assertIn("Usage:", output)
+                self.assertEqual(self.commands(), "")
+
+    def test_service_command_preserves_arguments_and_status(self):
+        with (self.project / "scripts/common.sh").open("a") as common:
+            common.write(r"""
+require_platform() { return 0; }
+as_service_user() {
+    [[ $# == 3 && "$1" == podman && "$2" == logs &&
+        "$3" == "argument with spaces" ]] || return 97
+    printf 'service logs received intact argument\n' >> "$TEST_LOG"
+    return "${TEST_LOGS_STATUS:-0}"
+}
+""")
+        for expected_status in (0, 125):
+            with self.subTest(expected_status=expected_status):
+                status, output = self.run_stage(
+                    "service-command.sh",
+                    arguments=("podman", "logs", "argument with spaces"),
+                    TEST_LOGS_STATUS=str(expected_status),
+                )
+                self.assertEqual(status, expected_status, output)
+                self.assertIn("service logs received intact argument", self.commands())
+
+    def test_service_command_routes_podman_to_service_store(self):
+        status, output = self.run_stage(
+            "service-command.sh",
+            arguments=("podman", "image", "exists", "localhost/postfix-webmin:local"),
+        )
+        self.assertEqual(status, 0, output)
+        self.assertIn(
+            "service: podman image exists localhost/postfix-webmin:local", self.commands()
+        )
 
     def test_push_uses_service_store_and_explicit_dockerhub_destination(self):
         destination = "docker.io/example/postfix-webmin:release-1"

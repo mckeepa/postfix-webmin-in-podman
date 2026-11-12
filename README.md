@@ -15,8 +15,13 @@ Webmin RPM version, and Webmin repository setup script are all pinned.
 ## Install
 
 To run a prebuilt DockerHub image without building locally, use the
-[client deployment guide](./CLIENT-DEPLOYMENT.md). The installation below is
-for building the image on the host.
+[client deployment guide](./CLIENT-DEPLOYMENT.md): run `./platform-setup.sh`
+followed by `./client-deploy.sh`. Client deployment pulls and deploys
+`docker.io/mckeepa/postfix-webmin:latest` by default; pass an approved image
+reference as its argument to select a release tag or digest. For updates,
+back up first and use `UPDATE_EXISTING=1 ./client-deploy.sh`, including any
+custom binding and TLS settings. The installation below is for building the
+image on the host.
 
 ```bash
 git clone https://github.com/mckeepa/postfix-webmin-in-podman.git
@@ -104,8 +109,18 @@ previous access granted for that port, and never reloads firewalld.
 ## Manage the service
 
 Podman container storage is account-specific. `podman ps` lists containers
-owned by the invoking account. The following helper runs management commands
-as the `postfix-webmin` service account:
+owned by the invoking account. Use the supplied wrapper from the project
+directory to run management commands as the `postfix-webmin` service account,
+without defining a shell function:
+
+```bash
+./service-command.sh systemctl --user status --no-pager postfix-webmin.service
+./service-command.sh podman logs --tail 100 postfix-webmin
+```
+
+Alternatively, define this helper in the **same terminal** as the commands
+that use it. It is not an installed command; repeat the definition whenever
+you open a new terminal:
 
 ```bash
 SERVICE_USER=postfix-webmin

@@ -123,4 +123,5 @@ if (( USER_MANAGER_READY == 0 )); then
     exit 1
 fi
 verify_rootless_runtime
-printf 'Platform ready for %s (UID %s). Next: ./build-image.sh\n' "$SERVICE_USER" "$SERVICE_UID"
+printf 'Platform ready for %s (UID %s).\n' "$SERVICE_USER" "$SERVICE_UID"
+printf 'Next: ./client-deploy.sh for a published image, or ./build-image.sh to build locally.\n'
