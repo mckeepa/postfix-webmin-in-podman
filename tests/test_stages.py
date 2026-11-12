@@ -50,6 +50,8 @@ as_service_user() {
             ;;
         'podman container') [[ "${TEST_CONTAINER:-1}" == 1 ]] ;;
         'podman build'|'podman rm'|'podman exec') return 0 ;;
+        'podman login') return "${TEST_LOGIN_STATUS:-0}" ;;
+        'podman push') return "${TEST_PUSH_STATUS:-0}" ;;
         'podman run') cat >/dev/null ;;
         *) printf 'Unexpected service command: %s\n' "$*" >&2; return 98 ;;
     esac
@@ -64,7 +66,7 @@ class StageTests(unittest.TestCase):
         self.project = Path(self.temp.name)
         (self.project / "scripts").mkdir()
         for name in ("setup.sh", "platform-setup.sh", "build-image.sh", "deploy.sh",
-                     "configure-firewall.sh"):
+                     "configure-firewall.sh", "push-image.sh"):
             shutil.copy2(ROOT / name, self.project / name)
         shutil.copytree(ROOT / "templates", self.project / "templates")
         common = (ROOT / "scripts/common.sh").read_text()
@@ -73,7 +75,8 @@ class StageTests(unittest.TestCase):
         self.quadlet = self.project / "test.container"
 
     def run_stage(self, name, interactive=False, arguments=(), **variables):
-        env = dict(os.environ, TEST_LOG=str(self.log), TEST_QUADLET=str(self.quadlet))
+        env = dict(os.environ, TEST_LOG=str(self.log), TEST_QUADLET=str(self.quadlet),
+                   DOCKERHUB_NAMESPACE="")
         env.update(variables)
         master, slave = pty.openpty() if interactive else (None, None)
         try:
@@ -252,6 +255,77 @@ awk() {
                 self.assertIn("Run ./platform-setup.sh first", output)
                 self.assertEqual(self.commands(), "")
 
+    def test_push_uses_service_store_and_explicit_dockerhub_destination(self):
+        destination = "docker.io/example/postfix-webmin:release-1"
+        status, output = self.run_stage("push-image.sh", arguments=(destination,))
+        self.assertEqual(status, 0, output)
+        commands = self.commands()
+        self.assertIn("podman image exists localhost/postfix-webmin:local", commands)
+        self.assertLess(commands.index("podman login docker.io"), commands.index("podman push"))
+        self.assertIn(
+            f"podman push localhost/postfix-webmin:local docker://{destination}", commands
+        )
+        self.assertNotIn("podman build", commands)
+        self.assertNotIn("podman volume", commands)
+        self.assertNotIn("systemctl --user start", commands)
+        self.assertIn("Image published:", output)
+
+    def test_push_rejects_missing_or_ambiguous_destinations(self):
+        for arguments in (
+            (), ("example/postfix-webmin:latest",),
+            ("docker.io/example/postfix-webmin",),
+            ("other.example/example/postfix-webmin:latest",),
+            ("docker.io/example/postfix-webmin:latest", "extra"),
+        ):
+            with self.subTest(arguments=arguments):
+                status, output = self.run_stage("push-image.sh", arguments=arguments)
+                self.assertNotEqual(status, 0, output)
+                self.assertIn("Usage:", output)
+                self.assertEqual(self.commands(), "")
+
+    def test_push_defaults_to_configured_namespace_and_allows_explicit_override(self):
+        for arguments, destination in (
+            ((), "docker.io/example-org/postfix-webmin:latest"),
+            (("docker.io/other/postfix-webmin:release-1",),
+             "docker.io/other/postfix-webmin:release-1"),
+        ):
+            with self.subTest(arguments=arguments):
+                self.log.unlink(missing_ok=True)
+                status, output = self.run_stage(
+                    "push-image.sh", arguments=arguments, DOCKERHUB_NAMESPACE="example-org"
+                )
+                self.assertEqual(status, 0, output)
+                self.assertIn(
+                    f"podman push localhost/postfix-webmin:local docker://{destination}",
+                    self.commands(),
+                )
+
+    def test_push_rejects_invalid_configured_namespace_before_login(self):
+        for namespace in ("Example", "example/extra", "example:5000", "example\nother"):
+            with self.subTest(namespace=namespace):
+                status, output = self.run_stage(
+                    "push-image.sh", DOCKERHUB_NAMESPACE=namespace
+                )
+                self.assertNotEqual(status, 0, output)
+                self.assertIn("Usage:", output)
+                self.assertEqual(self.commands(), "")
+
+    def test_push_stops_on_missing_image_or_registry_failure(self):
+        destination = "docker.io/example/postfix-webmin:release-1"
+        for variables, expected_status, forbidden in (
+            ({"TEST_IMAGE": "0"}, 1, "podman login"),
+            ({"TEST_LOGIN_STATUS": "125"}, 125, "podman push"),
+            ({"TEST_PUSH_STATUS": "125"}, 125, "Image published:"),
+        ):
+            with self.subTest(variables=variables):
+                self.log.unlink(missing_ok=True)
+                status, output = self.run_stage(
+                    "push-image.sh", arguments=(destination,), **variables
+                )
+                self.assertEqual(status, expected_status, output)
+                self.assertNotIn(forbidden, self.commands() + output)
+                self.assertNotIn("Image published:", output)
+
     def test_deploy_requires_image_before_stopping_service(self):
         status, output = self.run_stage("deploy.sh", TEST_IMAGE="0", UPDATE_EXISTING="1")
         self.assertNotEqual(status, 0)
@@ -332,7 +406,8 @@ awk() {
         )
         self.assertEqual(status, 0, output)
         self.assertIn("WARNING: WEBMIN_TLS_DIR is unset", output)
-        self.assertIn("self-signed by default", output)
+        self.assertIn("generates a unique self-signed certificate at first startup", output)
+        self.assertIn("reuses it from its persistent volume on later starts", output)
         commands = self.commands()
         self.assertLess(commands.index("podman run"), commands.index("systemctl --user start"))
         self.assertNotIn("systemctl --user stop", commands)
@@ -363,6 +438,97 @@ awk() {
 
 @unittest.skipUnless(os.environ.get("POSTFIX_WEBMIN_TEST_IMAGE"), "Set POSTFIX_WEBMIN_TEST_IMAGE for live SMTP testing")
 class ContainerTests(unittest.TestCase):
+    def test_webmin_certificate_is_generated_per_installation(self):
+        image = os.environ["POSTFIX_WEBMIN_TEST_IMAGE"]
+        defaults = subprocess.run(
+            ["podman", "run", "--rm", "--entrypoint", "/bin/sh", image, "-c",
+             "test ! -e /etc/webmin/miniserv.pem && "
+             "test -z \"$(find /var/webmin /usr/share/postfix-webmin-defaults/webmin-state "
+             "-type f -print -quit)\""],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(defaults.returncode, 0, defaults.stderr)
+
+        prefix = "postfix-webmin-cert-test-" + uuid.uuid4().hex[:8]
+        names = [prefix + suffix for suffix in ("-first", "-upgrade", "-restart", "-other")]
+        volumes = [prefix + suffix for suffix in ("-volume-a", "-volume-b")]
+
+        def start(name, volume):
+            subprocess.run(
+                ["podman", "run", "--rm", "-d", "--network", "none", "--name", name,
+                 "--volume", f"{volume}:/etc/webmin:Z", image],
+                check=True, capture_output=True, text=True, timeout=30,
+            )
+
+        def fingerprint(name):
+            error = "certificate marker was not created"
+            for _ in range(40):
+                marker = subprocess.run(
+                    ["podman", "exec", name, "test", "-e",
+                     "/etc/webmin/.postfix-webmin-self-signed"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if marker.returncode == 0:
+                    ready = subprocess.run(
+                        ["podman", "exec", name, "curl", "-kfsS",
+                         "https://127.0.0.1:10000/"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if ready.returncode == 0:
+                        result = subprocess.run(
+                            ["podman", "exec", name, "openssl", "x509", "-in",
+                             "/etc/webmin/miniserv.pem", "-noout", "-fingerprint", "-sha256"],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        if result.returncode == 0:
+                            return result.stdout.strip()
+                    else:
+                        error = ready.stderr
+                else:
+                    error = marker.stderr
+                time.sleep(0.25)
+            self.fail(f"Webmin did not create a ready HTTPS endpoint: {error}")
+
+        try:
+            for volume in volumes:
+                subprocess.run(
+                    ["podman", "volume", "create", volume],
+                    check=True, capture_output=True, text=True, timeout=30,
+                )
+
+            start(names[0], volumes[0])
+            original = fingerprint(names[0])
+            subprocess.run(
+                ["podman", "exec", names[0], "rm", "/etc/webmin/.postfix-webmin-self-signed"],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            subprocess.run(
+                ["podman", "rm", "--force", names[0]],
+                check=True, capture_output=True, text=True, timeout=30,
+            )
+
+            start(names[1], volumes[0])
+            rotated = fingerprint(names[1])
+            self.assertNotEqual(original, rotated)
+            subprocess.run(
+                ["podman", "rm", "--force", names[1]],
+                check=True, capture_output=True, text=True, timeout=30,
+            )
+
+            start(names[2], volumes[0])
+            self.assertEqual(fingerprint(names[2]), rotated)
+            start(names[3], volumes[1])
+            self.assertNotEqual(fingerprint(names[3]), rotated)
+        finally:
+            subprocess.run(
+                ["podman", "rm", "--force", *names],
+                capture_output=True, timeout=30,
+            )
+            subprocess.run(
+                ["podman", "volume", "rm", "--force", *volumes],
+                capture_output=True, timeout=30,
+            )
+
     def test_published_smtp_port_returns_greeting(self):
         image = os.environ["POSTFIX_WEBMIN_TEST_IMAGE"]
         name = "postfix-webmin-smtp-test-" + uuid.uuid4().hex[:8]

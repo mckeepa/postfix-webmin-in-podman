@@ -30,7 +30,7 @@ elif as_service_user test -f "$QUADLET_FILE" &&
     printf 'External TLS is already enabled. Specify WEBMIN_TLS_DIR again; refusing to remove its mount.\n' >&2
     exit 1
 else
-    printf 'WARNING: WEBMIN_TLS_DIR is unset. Webmin will use its stored certificate (self-signed by default). Set WEBMIN_TLS_DIR for CA-issued TLS.\n' >&2
+    printf 'WARNING: WEBMIN_TLS_DIR is unset. Webmin generates a unique self-signed certificate at first startup and reuses it from its persistent volume on later starts. Set WEBMIN_TLS_DIR for CA-issued TLS.\n' >&2
 fi
 
 # Render as text, not shell code, before stopping an existing deployment.

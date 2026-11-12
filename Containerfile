@@ -14,10 +14,13 @@ RUN dnf upgrade -y && \
     mkdir -p /usr/share/postfix-webmin-defaults && \
     cp -a /etc/postfix /usr/share/postfix-webmin-defaults/postfix && \
     cp -a /var/spool/postfix /usr/share/postfix-webmin-defaults/postfix-queue && \
-    mkdir -p /usr/share/postfix-webmin-defaults/mail /var/mail /var/webmin && \
+    mkdir -p /usr/share/postfix-webmin-defaults/mail /var/mail \
+        /usr/share/postfix-webmin-defaults/webmin-state && \
     cp -aL /var/mail/. /usr/share/postfix-webmin-defaults/mail/ && \
+    rm -f /etc/webmin/miniserv.pem && \
     cp -a /etc/webmin /usr/share/postfix-webmin-defaults/webmin && \
-    cp -a /var/webmin /usr/share/postfix-webmin-defaults/webmin-state
+    rm -rf /var/webmin && \
+    install -d -o root -g bin -m 0700 /var/webmin
 
 EXPOSE 10000 25
 

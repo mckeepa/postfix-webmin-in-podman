@@ -28,6 +28,20 @@ stop_cmd=/usr/sbin/postfix stop
 reload_cmd=/usr/sbin/postfix reload
 EOF
 
+generate_self_signed_certificate() (
+    temp_dir="$(mktemp -d)"
+    temp_pem="$(mktemp /etc/webmin/.miniserv.pem.XXXXXX)"
+    trap 'rm -rf -- "$temp_dir"; rm -f -- "$temp_pem"' EXIT
+    openssl req -x509 -newkey rsa:3072 -nodes -days 3650 \
+        -keyout "$temp_dir/key.pem" -out "$temp_dir/cert.pem" \
+        -subj '/CN=postfix-webmin'
+    cat "$temp_dir/key.pem" "$temp_dir/cert.pem" > "$temp_pem"
+    chmod 0600 "$temp_pem"
+    mv -f -- "$temp_pem" /etc/webmin/miniserv.pem
+    : > /etc/webmin/.postfix-webmin-self-signed
+    chmod 0600 /etc/webmin/.postfix-webmin-self-signed
+)
+
 if [ -n "${WEBMIN_TLS_DIR:-}" ]; then
     for file in cert.pem privkey.pem; do
         if [ ! -r "$WEBMIN_TLS_DIR/$file" ] || [ ! -s "$WEBMIN_TLS_DIR/$file" ]; then
@@ -58,6 +72,11 @@ if [ -n "${WEBMIN_TLS_DIR:-}" ]; then
 elif grep -Eq '^(keyfile|certfile)=/run/webmin-tls/' /etc/webmin/miniserv.conf; then
     printf 'Webmin uses mounted TLS certificates; start with WEBMIN_TLS_DIR and its certificate mount.\n' >&2
     exit 1
+fi
+
+if { [ -e /etc/webmin/miniserv.pem ] && [ ! -e /etc/webmin/.postfix-webmin-self-signed ]; } ||
+    { [ -z "${WEBMIN_TLS_DIR:-}" ] && [ ! -s /etc/webmin/miniserv.pem ]; }; then
+    generate_self_signed_certificate
 fi
 
 /usr/sbin/postfix start
